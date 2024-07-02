@@ -5,7 +5,8 @@
 # blender --background --python mytest.py -- --views 10 /path/to/my.obj
 #
 
-import argparse, sys, os
+import argparse, sys, os, json
+import copy 
 parser = argparse.ArgumentParser(description='Renders given obj file by rotation a camera around it.')
 parser.add_argument('--views', type=int, default=1,
                     help='number of views to be rendered')
@@ -23,14 +24,9 @@ parser.add_argument('--color_depth', type=str, default='8',
                     help='Number of bit per channel used for output. Either 8 or 16.')
 parser.add_argument('--format', type=str, default='PNG',
                     help='Format of files generated. Either PNG or OPEN_EXR')
-parser.add_argument('--obj_image_easy_dir', type=str)
-parser.add_argument('--obj_albedo_easy_dir', type=str)
-parser.add_argument('--obj_depth_easy_dir', type=str)
-parser.add_argument('--obj_normal_easy_dir', type=str)
-parser.add_argument('--obj_image_hard_dir', type=str)
-parser.add_argument('--obj_albedo_hard_dir', type=str)
-parser.add_argument('--obj_depth_hard_dir', type=str)
-parser.add_argument('--obj_normal_hard_dir', type=str)
+parser.add_argument('--obj_save_dir', type=str)
+
+
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 args = parser.parse_args(argv)
@@ -38,130 +34,102 @@ import numpy as np
 import bpy
 import cv2
 
-# Set up rendering of depth map.
+
+def listify_matrix(matrix):
+    matrix_list = []
+    for row in matrix:
+        matrix_list.append(list(row))
+    return matrix_list
+
+# Set up rendering of depth map using nodes
 bpy.context.scene.use_nodes = True
 tree = bpy.context.scene.node_tree
+bpy.context.view_layer.use_pass_normal = True
+bpy.context.view_layer.use_pass_combined = True
+bpy.context.view_layer.use_pass_z = True
+bpy.context.scene.render.image_settings.file_format = 'PNG'
+bpy.context.scene.render.image_settings.color_depth = str(8)
+
+render_layers_node = tree.nodes.new('CompositorNodeRLayers')
+
+# Setup for output of depth
+# Link nodes
 links = tree.links
-# Add passes for additionally dumping albedo and normals.
-bpy.context.scene.render.layers["RenderLayer"].use_pass_normal = True
-bpy.context.scene.render.layers["RenderLayer"].use_pass_color = True
-bpy.context.scene.render.image_settings.file_format = args.format
-bpy.context.scene.render.image_settings.color_depth = args.color_depth
-
-# Clear default nodes
-for n in tree.nodes:
-    tree.nodes.remove(n)
-
-# Create input render layer node.
-render_layers = tree.nodes.new('CompositorNodeRLayers')
+# clear default nodes
+# for n in tree.nodes:
+#     tree.nodes.remove(n)
 
 depth_file_output = tree.nodes.new(type="CompositorNodeOutputFile")
+depth_file_output.base_path = args.obj_save_dir
 depth_file_output.label = 'Depth Output'
-if args.format == 'OPEN_EXR':
-  links.new(render_layers.outputs['Depth'], depth_file_output.inputs[0])
-else:
-  # Remap as other types can not represent the full range of depth.
-  map = tree.nodes.new(type="CompositorNodeMapValue")
-  # Size is chosen kind of arbitrarily, try out until you're satisfied with resulting depth map.
-  map.offset = [-0.7]
-  map.size = [args.depth_scale]
-  map.use_min = True
-  map.min = [0]
-  links.new(render_layers.outputs['Depth'], map.inputs[0])
+depth_file_output.name = 'Depth Output'
+# Remap as other types can not represent the full range of depth.
+map = tree.nodes.new(type="CompositorNodeMapRange")
+# Size is chosen kind of arbitrarily, try out until you're satisfied with resulting depth map.
+map.inputs['From Min'].default_value = 0
+map.inputs['From Max'].default_value = 8
+map.inputs['To Min'].default_value = 1
+map.inputs['To Max'].default_value = 0
+links.new(render_layers_node.outputs['Depth'], map.inputs[0])
+links.new(map.outputs[0], depth_file_output.inputs[0])
 
-  links.new(map.outputs[0], depth_file_output.inputs[0])
-
-scale_normal = tree.nodes.new(type="CompositorNodeMixRGB")
-scale_normal.blend_type = 'MULTIPLY'
-# scale_normal.use_alpha = True
-scale_normal.inputs[2].default_value = (0.5, 0.5, 0.5, 1)
-links.new(render_layers.outputs['Normal'], scale_normal.inputs[1])
-
-bias_normal = tree.nodes.new(type="CompositorNodeMixRGB")
-bias_normal.blend_type = 'ADD'
-# bias_normal.use_alpha = True
-bias_normal.inputs[2].default_value = (0.5, 0.5, 0.5, 0)
-links.new(scale_normal.outputs[0], bias_normal.inputs[1])
-
+#  Setup for output of normals
 normal_file_output = tree.nodes.new(type="CompositorNodeOutputFile")
+normal_file_output.base_path = args.obj_save_dir
 normal_file_output.label = 'Normal Output'
-links.new(bias_normal.outputs[0], normal_file_output.inputs[0])
+normal_file_output.name = 'Normal Output'
+links.new(render_layers_node.outputs['Normal'], normal_file_output.inputs[0])
 
-albedo_file_output = tree.nodes.new(type="CompositorNodeOutputFile")
-albedo_file_output.label = 'Albedo Output'
-links.new(render_layers.outputs['Color'], albedo_file_output.inputs[0])
-
-# Delete default cube
-bpy.data.objects['Cube'].select = True
+# Import OBJ file
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.object.select_by_type(type='MESH')
 bpy.ops.object.delete()
-target_obj = None
-bpy.ops.import_scene.obj(filepath=args.obj+'.obj')
-for object in bpy.context.scene.objects:
-    if object.name in ['Camera', 'Lamp']:
-        continue
-    bpy.context.scene.objects.active = object
-    target_obj = object
-    if args.scale != 1:
-        bpy.ops.transform.resize(value=(args.scale,args.scale,args.scale))
-        bpy.ops.object.transform_apply(scale=True)
-    if args.remove_doubles:
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.remove_doubles()
-        bpy.ops.object.mode_set(mode='OBJECT')
-    if args.edge_split:
-        bpy.ops.object.modifier_add(type='EDGE_SPLIT')
-        bpy.context.object.modifiers["EdgeSplit"].split_angle = 1.32645
-        bpy.ops.object.modifier_apply(apply_as='DATA', modifier="EdgeSplit")
+imported_obj = bpy.ops.import_scene.obj(filepath=args.obj)
+obj_object = bpy.context.selected_objects[0]  # Assumes imported obj has one main object
+# Reset object's location
+obj_object.location = (0, 0, 0)
+bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+# Scale, remove doubles, add edge split if specified
+if args.scale != 1:
+    obj_object.scale = (args.scale, args.scale, args.scale)
+if args.remove_doubles:
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.remove_doubles()
+    bpy.ops.object.mode_set(mode='OBJECT')
+if args.edge_split:
+    modifier = obj_object.modifiers.new(name='EdgeSplit', type='EDGE_SPLIT')
+    modifier.split_angle = 1.32645
+    bpy.ops.object.modifier_apply(modifier="EdgeSplit")
 
-# Make light just directional, disable shadows.
-lamp = bpy.data.lamps['Lamp']
-lamp.type = 'SUN'
-lamp.shadow_method = 'NOSHADOW'
-# Possibly disable specular shading:
-lamp.use_specular = False
+# Render
+# Background
+# bpy.context.scene.render.dither_intensity = 0.0
+# bpy.context.scene.render.film_transparent = True
 
-# Add another light source so stuff facing away from light is not completely dark
-light_data = bpy.data.lamps.new(name="light_2", type='HEMI')
-light_data.energy = 0.5
-light2 = bpy.data.objects.new(name="light_2", object_data=light_data)
-bpy.context.scene.objects.link(light2)
-# make it active
-bpy.context.scene.objects.active = light2
-
-# light_data.use_specular = False
-# bpy.data.objects['light_2'].rotation_euler = bpy.data.objects['Lamp'].rotation_euler
-# bpy.data.objects['light_2'].rotation_euler[0] += 180
-# bpy.data.objects['light_2'].location= (30, 0, 30)
+# Setup lights and camera
+light_data = bpy.data.lights.new(name="Light", type='POINT')
+light_data.energy = 1
+light_object = bpy.data.objects.new(name="Light", object_data=light_data)
+bpy.context.collection.objects.link(light_object)
+light_object.location = (3, 3, 5)
 
 
-# Add another light source so stuff facing away from light is not completely dark
-bpy.ops.object.lamp_add(type='SUN')
-lamp2 = bpy.data.lamps['Sun']
-lamp2.shadow_method = 'NOSHADOW'
-lamp2.use_specular = False
-lamp2.energy = 0.5
-# bpy.data.objects['Sun'].location = (0, 100, 0)
-# bpy.data.objects['Sun'].rotation_euler = bpy.data.objects['Lamp'].rotation_euler
-bpy.data.objects['Sun'].rotation_euler[0] += 180
 
+# Render settings
 def parent_obj_to_camera(b_camera):
-    origin = (0.0, 0.0, 0.0)
+    origin = (0, 0, 0)
     b_empty = bpy.data.objects.new("Empty", None)
     b_empty.location = origin
     b_camera.parent = b_empty  # setup parenting
 
     scn = bpy.context.scene
-    scn.objects.link(b_empty)
-    scn.objects.active = b_empty
+    scn.collection.objects.link(b_empty)
+    bpy.context.view_layer.objects.active = b_empty
+    # scn.objects.active = b_empty
     return b_empty
 
-def unit(v):
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
 def camera_info(param):
+    "params: [theta, phi, rho, x, y, z, f]"
     theta = np.deg2rad(param[0])
     phi = np.deg2rad(param[1])
     # print(param[0],param[1], theta, phi, param[6])
@@ -178,7 +146,7 @@ def camera_info(param):
     # axisY = np.cross(axisZ, axisX)
 
     # cam_mat = np.array([unit(axisX), unit(axisY), unit(axisZ)])
-    print(camX, camY, camZ)
+    print("cam axis",camX, camY, camZ)
     return camX, -camZ, camY
 
 def check_valid(file):
@@ -188,95 +156,131 @@ def check_valid(file):
     return False
 
 scene = bpy.context.scene
-scene.render.resolution_x = 224
-scene.render.resolution_y = 224
+scene.render.resolution_x = 400
+scene.render.resolution_y = 400
 scene.render.resolution_percentage = 100
-scene.render.alpha_mode = 'TRANSPARENT'
+
+# Background
+bpy.context.scene.render.dither_intensity = 0.0
+bpy.context.scene.render.film_transparent = True
+
+# GPU
+# import bpy
+# bpy.context.scene.render.engine = 'CYCLES'
+# # Enable Cycles add-on if not already enabled
+# bpy.ops.preferences.addon_enable(module="cycles")
+
+# # Set the device_type
+# cycles_preferences = bpy.context.preferences.addons['cycles'].preferences
+# cycles_preferences.compute_device_type = 'CUDA'
+# bpy.context.scene.cycles.device = 'GPU'
+
+
+# Data to store in JSON file
+out_data = {
+    'camera_angle_x': bpy.data.objects['Camera'].data.angle_x,
+}
+
+# scene.render.alpha_mode = 'TRANSPARENT'
 cam = scene.objects['Camera']
+cam.location = (0, -0.8, 1.0)
 cam_constraint = cam.constraints.new(type='TRACK_TO')
 cam_constraint.track_axis = 'TRACK_NEGATIVE_Z'
 cam_constraint.up_axis = 'UP_Y'
 b_empty = parent_obj_to_camera(cam)
 cam_constraint.target = b_empty
 
-# scene.render.image_settings.file_format = 'PNG'  # set output format to .png
+scene.render.image_settings.file_format = 'PNG'  # set output format to .png
+
+from math import radians
+
+stepsize = 360.0 / args.views
+# to make the output reproduce, we fix seed and generate vertical difference at beginning
+CIRCLE_FIXED_START = (0,0,0)
+CIRCLE_FIXED_END = (.7,0,0)
+# random vertical
+np.random.seed(42)
+vertical_list = np.random.rand(args.views) *  np.pi/4
+
+
+vertical_diff = CIRCLE_FIXED_END[0] - CIRCLE_FIXED_START[0]
+# print("vertical_list", vertical_list)
 
 rotation_mode = 'XYZ'
 
-stepsize = 360 / args.views
+obj_save_dir = args.obj_save_dir
+
+# TODO easy and hard 
+
+out_data['frames'] = []
+b_empty.rotation_euler = CIRCLE_FIXED_START
+b_empty.rotation_euler[0] = vertical_list[0]
+
+# for output_node in [tree.nodes['Depth Output'], tree.nodes['Normal Output']]:
+#     output_node.base_path = '/'
 
 
-for output_node in [depth_file_output, normal_file_output, albedo_file_output]:
-    output_node.base_path = ''
-    output_node.format.file_format="PNG"
+current_rot_value = 0
+for i in range(args.views):
+    # current_rot_value += stepsize
+    # counter = 0
+    # # while True: # 
+    # counter+=1
+    # angle_rand = np.random.rand(3)
+    # y_rot = current_rot_value + angle_rand[0] * 10 - 5
+    # x_rot = 20 + angle_rand[1] * 10
+    # dist = 0.65 + angle_rand[2] * 0.35
 
-#
-# obj_image_easy_dir, obj_albedo_easy_dir, obj_depth_easy_dir, obj_normal_easy_dir, obj_image_hard_dir, obj_albedo_hard_dir, obj_depth_hard_dir, obj_normal_hard_dir
+    # param = [y_rot, x_rot, 0, dist, 35, 32, 1.75]
+    # camX, camY, camZ = camera_info(param)
+    # cam.location = (camX, camY, camZ)
 
-obj_image_dir = [args.obj_image_easy_dir, args.obj_image_hard_dir]
-obj_albedo_dir = [args.obj_albedo_easy_dir, args.obj_albedo_hard_dir]
-obj_depth_dir = [args.obj_depth_easy_dir, args.obj_depth_hard_dir]
-obj_normal_dir = [args.obj_normal_easy_dir, args.obj_normal_hard_dir]
+    scene.render.filepath = obj_save_dir + '/image/' + str(i).zfill(3)
 
-target_obj.location = (0.0, 0.0, 0.0)
+    tree.nodes['Depth Output'].file_slots[0].path = "/depth/" + str(i).zfill(3)
+    tree.nodes['Normal Output'].file_slots[0].path =  "/normal/" + str(i).zfill(3)
+
+    bpy.ops.render.render(write_still=True)  # render still
 
 
-for j in range(2):
-    current_rot_value = 0
-    metastring = ""
-    for i in range(args.views):
-        current_rot_value += stepsize
-        counter = 0
-        while True:
-            counter+=1
-            if j == 1:
-                if counter < 5:
-                    shift_rand = np.random.rand(3) * 0.4 - 0.2
-                    target_obj.location = (shift_rand[0], shift_rand[1], shift_rand[2])
-                    print("target_obj.location", target_obj.location)
-                else:
-                    shift_rand = np.random.rand(3) * 0.2 - 0.1
-                    target_obj.location = (shift_rand[0], shift_rand[1], shift_rand[2])
-                    print("target_obj.location", target_obj.location)
 
-            angle_rand = np.random.rand(3)
-            y_rot = current_rot_value + angle_rand[0] * 10 - 5
-            if j == 0:
-                x_rot = 20 + angle_rand[1] * 10
-            else:
-                x_rot = angle_rand[1] * 45
-            if j== 0:
-                dist = 0.65 + angle_rand[2] * 0.35
-            elif counter >= 5:
-                dist = 0.75 + angle_rand[2] * 0.35
-            else:
-                dist = 0.60 + angle_rand[2] * 0.40
-            param = [y_rot, x_rot, 0, dist, 35, 32, 1.75]
-            camX, camY, camZ = camera_info(param)
-            cam.location = (camX, camY, camZ)
-            scene.render.filepath = obj_image_dir[j] + '/{0:02d}'.format(i)#
-            depth_file_output.file_slots[0].path = obj_depth_dir[j] + '/{0:02d}'.format(i)#
-            normal_file_output.file_slots[0].path = obj_normal_dir[j] + '/{0:02d}'.format(i)#
-            albedo_file_output.file_slots[0].path = obj_albedo_dir[j] + '/{0:02d}'.format(i)#
-            bpy.ops.render.render(write_still=True)  # render still
-            if check_valid(scene.render.filepath+".png"):
-                os.rename(obj_depth_dir[j] + '/{0:02d}'.format(i) + "0001.png",
-                          obj_depth_dir[j] + '/{0:02d}'.format(i) + ".png")
-                os.rename(obj_normal_dir[j] + '/{0:02d}'.format(i) + "0001.png",
-                          obj_normal_dir[j] + '/{0:02d}'.format(i) + ".png")
-                os.rename(obj_albedo_dir[j] + '/{0:02d}'.format(i) + "0001.png",
-                          obj_albedo_dir[j] + '/{0:02d}'.format(i) + ".png")
-                break
-            else:
-                print("regen: ", scene.render.filepath+".png")
-        metastring = metastring + "[{},{},{},{},{},{},{},{},{},{}], \n" \
-                     .format(y_rot, x_rot, 0, dist, 35, 32, 1.75,
-                        target_obj.location[0], target_obj.location[1], target_obj.location[2])
-    with open(obj_image_dir[j]+"/rendering_metadata.txt", "w") as f:
-        f.write(metastring)
-    with open(obj_albedo_dir[j]+"/rendering_metadata.txt", "w") as f:
-        f.write(metastring)
-    with open(obj_depth_dir[j]+"/rendering_metadata.txt", "w") as f:
-        f.write(metastring)
-    with open(obj_normal_dir[j]+"/rendering_metadata.txt", "w") as f:
-        f.write(metastring)
+    frame_data = {
+        'file_path': 'image/' + str(i).zfill(3),
+        'rotation': radians(stepsize),
+        'transform_matrix': listify_matrix(cam.matrix_world)
+    }
+    out_data['frames'].append(frame_data)
+
+    if i == args.views - 1:
+        break
+    b_empty.rotation_euler[0] = vertical_list[i+1]
+    # CIRCLE_FIXED_START[0] + (np.cos(radians(stepsize*i))+1)/2 * vertical_diff
+    # vertical_list[i]
+    # CIRCLE_FIXED_START[0] + (np.cos(radians(stepsize*i))+1)/2 * vertical_diff
+    b_empty.rotation_euler[2] += radians(stepsize)
+
+
+with open(obj_save_dir+ '/' + 'transforms.json', 'w') as out_file:
+    json.dump(out_data, out_file, indent=4)
+
+
+test_json = copy.deepcopy(out_data)
+test_json['frames'] = test_json['frames'][-4:]
+
+with open(os.path.join(obj_save_dir,'transforms_test.json'), 'w') as f:
+    json.dump(test_json, f, indent=4) 
+
+with open(os.path.join(obj_save_dir,'transforms_val.json'), 'w') as f:
+    json.dump(test_json, f, indent=4) 
+
+
+# zip image file, depth files and normals
+import shutil
+shutil.make_archive(os.path.join(obj_save_dir,'image'), 'zip', os.path.join(obj_save_dir,'image'))
+shutil.make_archive(os.path.join(obj_save_dir,'depth'), 'zip', os.path.join(obj_save_dir,'depth'))
+shutil.make_archive(os.path.join(obj_save_dir,'normal'), 'zip', os.path.join(obj_save_dir,'normal'))
+
+shutil.rmtree(os.path.join(obj_save_dir,'image'))
+shutil.rmtree(os.path.join(obj_save_dir,'depth'))
+shutil.rmtree(os.path.join(obj_save_dir,'normal'))
+# print("vertical_list", vertical_list)
